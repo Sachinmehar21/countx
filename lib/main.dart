@@ -1,11 +1,24 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'services/local_storage_service.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'firebase_options.dart';
+import 'services/firebase_service.dart';
 import 'models/counter_model.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  
+  // Initialize Firebase
+  try {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+    print('✅ Firebase initialized successfully!');
+  } catch (e) {
+    print('❌ Firebase initialization failed: $e');
+  }
+  
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
       statusBarColor: Colors.transparent,
@@ -48,13 +61,14 @@ class _HomePageState extends State<HomePage> {
   // Mint green color
   static const Color mintGreen = Color(0xFF00E676);
 
-  // Local storage service
-  final LocalStorageService _storageService = LocalStorageService();
+  // Firebase service for cloud storage
+  final FirebaseService _storageService = FirebaseService();
 
   // Counter state
   int _count = 0;
   String _counterName = 'Count';
   String? _currentCounterId;
+  String? _currentCollectionName;
 
   // Time filter state
   bool _isYearView = true;
@@ -69,11 +83,17 @@ class _HomePageState extends State<HomePage> {
   bool _statsExpanded = false;
   final ScrollController _scrollController = ScrollController();
 
+  // PageView controller for counter switching
+  PageController? _pageController;
+
   // Dark mode state
   bool _isDarkMode = false;
 
   // Loading state
   bool _isLoading = true;
+
+  // Pending counter to switch to after creation
+  String? _pendingCounterId;
 
   // Archived counters state
   bool _archivedExpanded = false;
@@ -92,10 +112,19 @@ class _HomePageState extends State<HomePage> {
     _loadCounters();
   }
 
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    _pageController?.dispose();
+    super.dispose();
+  }
+
   void _loadCounters() {
     _storageService.getCounters().listen(
       (counters) {
         setState(() {
+          // Sort by creation date
+          counters.sort((a, b) => a.createdAt.compareTo(b.createdAt));
           _counters = counters;
           _isLoading = false;
           
@@ -103,12 +132,34 @@ class _HomePageState extends State<HomePage> {
             // Create default counter if none exists
             _createDefaultCounter();
           } else {
+            // If we have a pending counter to switch to, find it
+            if (_pendingCounterId != null) {
+              final index = _counters.indexWhere((c) => c.id == _pendingCounterId);
+              if (index >= 0) {
+                _currentCounterIndex = index;
+                _pendingCounterId = null;
+                // Animate to the new counter after build completes
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (_pageController != null && _pageController!.hasClients) {
+                    _pageController!.animateToPage(
+                      index,
+                      duration: const Duration(milliseconds: 300),
+                      curve: Curves.easeInOut,
+                    );
+                  }
+                });
+              }
+            }
             // Set current counter
             if (_currentCounterIndex >= _counters.length) {
+              _currentCounterIndex = _counters.length - 1;
+            }
+            if (_currentCounterIndex < 0) {
               _currentCounterIndex = 0;
             }
             _currentCounterId = _counters[_currentCounterIndex].id;
             _counterName = _counters[_currentCounterIndex].name;
+            _currentCollectionName = _counters[_currentCounterIndex].collectionName;
             _loadCount();
           }
         });
@@ -144,39 +195,54 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _loadCount() async {
-    if (_currentCounterId == null) return;
+    if (_currentCollectionName == null) return;
     
-    int count;
-    if (_isYearView) {
-      count = await _storageService.getYearCount(_currentCounterId!, _selectedYear);
-    } else {
-      count = await _storageService.getMonthCount(_currentCounterId!, _selectedYear, _selectedMonth);
+    try {
+      int count;
+      if (_isYearView) {
+        count = await _storageService.getYearCount(_currentCollectionName!, _selectedYear);
+      } else {
+        count = await _storageService.getMonthCount(_currentCollectionName!, _selectedYear, _selectedMonth);
+      }
+      setState(() {
+        _count = count;
+      });
+      
+      // Load stats data
+      _loadStatsData();
+    } catch (e) {
+      print('Error loading count: $e');
+      setState(() {
+        _count = 0;
+      });
     }
-    setState(() {
-      _count = count;
-    });
-    
-    // Load stats data
-    _loadStatsData();
   }
 
   Future<void> _loadStatsData() async {
-    if (_currentCounterId == null) return;
+    if (_currentCollectionName == null) return;
     
-    final monthlyData = await _storageService.getMonthlyCountsForYear(_currentCounterId!, _statsYear);
-    final yearlyData = await _storageService.getDailyCountsForYear(_currentCounterId!, _statsYear);
-    
-    setState(() {
-      _monthlyData = monthlyData;
-      _yearlyHeatmapData = yearlyData;
-    });
+    try {
+      final monthlyData = await _storageService.getMonthlyCountsForYear(_currentCollectionName!, _statsYear);
+      final yearlyData = await _storageService.getDailyCountsForYear(_currentCollectionName!, _statsYear);
+      
+      setState(() {
+        _monthlyData = monthlyData;
+        _yearlyHeatmapData = yearlyData;
+      });
+    } catch (e) {
+      print('Error loading stats: $e');
+      setState(() {
+        _monthlyData = {};
+        _yearlyHeatmapData = {};
+      });
+    }
   }
 
   void _increment() async {
-    if (_currentCounterId == null) return;
+    if (_currentCollectionName == null) return;
     HapticFeedback.lightImpact();
     
-    await _storageService.addEntry(_currentCounterId!);
+    await _storageService.addEntry(_currentCollectionName!);
     setState(() {
       _count++;
     });
@@ -184,10 +250,10 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _decrement() async {
-    if (_currentCounterId == null || _count <= 0) return;
+    if (_currentCollectionName == null || _count <= 0) return;
     HapticFeedback.lightImpact();
     
-    await _storageService.removeLastEntry(_currentCounterId!);
+    await _storageService.removeLastEntry(_currentCollectionName!);
     setState(() {
       _count--;
     });
@@ -295,7 +361,22 @@ class _HomePageState extends State<HomePage> {
                 Navigator.pop(context);
                 if (_currentCounterId != null && _counters.length > 1) {
                   await _storageService.archiveCounter(_currentCounterId!);
-                  _loadCounters();
+                  // Reset to first counter after archiving
+                  setState(() {
+                    _currentCounterIndex = 0;
+                    _pageController?.jumpToPage(0);
+                  });
+                } else if (_counters.length <= 1) {
+                  // Show snackbar that you can't archive the last counter
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        'Cannot archive the last counter. Create another counter first.',
+                        style: GoogleFonts.poppins(),
+                      ),
+                      backgroundColor: Colors.red.shade700,
+                    ),
+                  );
                 }
               },
             ),
@@ -394,7 +475,10 @@ class _HomePageState extends State<HomePage> {
                         ),
                         onPressed: () async {
                           await _storageService.unarchiveCounter(counter.id);
-                          _loadCounters();
+                          // Set pending to switch to unarchived counter
+                          setState(() {
+                            _pendingCounterId = counter.id;
+                          });
                         },
                       ),
                     );
@@ -463,9 +547,13 @@ class _HomePageState extends State<HomePage> {
           TextButton(
             onPressed: () async {
               if (controller.text.isNotEmpty) {
-                await _storageService.addCounter(controller.text);
+                final newId = await _storageService.addCounter(controller.text);
                 Navigator.pop(context);
-                _loadCounters();
+                // Set pending counter to switch to the new one
+                setState(() {
+                  _pendingCounterId = newId;
+                });
+                // The stream listener will handle the rest
               }
             },
             child: const Text('Add', style: TextStyle(color: mintGreen)),
@@ -589,12 +677,14 @@ class _HomePageState extends State<HomePage> {
                   ),
                 )
               : PageView.builder(
+                  controller: _pageController ??= PageController(initialPage: _currentCounterIndex),
                   itemCount: _counters.length,
                   onPageChanged: (index) async {
                     setState(() {
                       _currentCounterIndex = index;
                       _currentCounterId = _counters[index].id;
                       _counterName = _counters[index].name;
+                      _currentCollectionName = _counters[index].collectionName;
                     });
                     await _loadCount();
                   },
@@ -647,6 +737,26 @@ class _HomePageState extends State<HomePage> {
               ],
             ),
           ),
+
+          // Page indicator dots
+          if (_counters.length > 1)
+            Padding(
+              padding: const EdgeInsets.only(top: 16),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: List.generate(_counters.length, (index) {
+                  return Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 4),
+                    width: index == _currentCounterIndex ? 24 : 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: index == _currentCounterIndex ? mintGreen : textColorSecondary.withOpacity(0.3),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  );
+                }),
+              ),
+            ),
 
           const SizedBox(height: 40),
 

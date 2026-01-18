@@ -6,7 +6,20 @@ class FirebaseService {
 
   // Collection references
   CollectionReference get _countersRef => _firestore.collection('counters');
-  CollectionReference get _entriesRef => _firestore.collection('counter_entries');
+  
+  // Get entries collection for a specific counter (using counter name)
+  CollectionReference _getEntriesRefByName(String collectionName) {
+    return _firestore.collection(collectionName);
+  }
+
+  // Helper to sanitize name for collection
+  String _sanitizeName(String name) {
+    return name
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]'), '_')
+        .replaceAll(RegExp(r'_+'), '_')
+        .replaceAll(RegExp(r'^_|_$'), '');
+  }
 
   // ==================== COUNTERS ====================
 
@@ -34,18 +47,22 @@ class FirebaseService {
             snapshot.docs.map((doc) => Counter.fromFirestore(doc)).toList());
   }
 
-  // Add a new counter
+  // Add a new counter (creates a new collection for its entries)
   Future<String> addCounter(String name) async {
+    final collectionName = _sanitizeName(name);
     final doc = await _countersRef.add({
       'name': name,
+      'collectionName': collectionName,
       'archived': false,
       'displayOrder': 0,
       'createdAt': FieldValue.serverTimestamp(),
     });
+    print('[Firebase] Created new counter: ${doc.id}');
+    print('[Firebase] Entries will be stored in collection: $collectionName');
     return doc.id;
   }
 
-  // Update counter name
+  // Update counter name (note: collection name stays same to preserve data)
   Future<void> updateCounterName(String counterId, String newName) async {
     await _countersRef.doc(counterId).update({'name': newName});
   }
@@ -60,36 +77,35 @@ class FirebaseService {
     await _countersRef.doc(counterId).update({'archived': false});
   }
 
-  // Delete a counter and all its entries
-  Future<void> deleteCounter(String counterId) async {
-    // Delete all entries for this counter
-    final entries = await _entriesRef
-        .where('counterId', isEqualTo: counterId)
-        .get();
+  // Delete a counter and all its entries (deletes the entire collection)
+  Future<void> deleteCounter(String counterId, String collectionName) async {
+    // Delete all entries in the counter's own collection
+    final entriesRef = _getEntriesRefByName(collectionName);
+    final entries = await entriesRef.get();
     
     final batch = _firestore.batch();
     for (var doc in entries.docs) {
       batch.delete(doc.reference);
     }
+    // Delete the counter document
     batch.delete(_countersRef.doc(counterId));
     await batch.commit();
+    print('[Firebase] Deleted counter $counterId and collection $collectionName');
   }
 
   // ==================== COUNTER ENTRIES ====================
 
-  // Add a new entry (increment counter)
-  Future<void> addEntry(String counterId, {int value = 1}) async {
-    await _entriesRef.add({
-      'counterId': counterId,
+  // Add a new entry (increment counter) - adds to counter's own collection
+  Future<void> addEntry(String collectionName, {int value = 1}) async {
+    await _getEntriesRefByName(collectionName).add({
       'value': value,
       'createdAt': FieldValue.serverTimestamp(),
     });
   }
 
   // Remove last entry (decrement counter)
-  Future<void> removeLastEntry(String counterId) async {
-    final lastEntry = await _entriesRef
-        .where('counterId', isEqualTo: counterId)
+  Future<void> removeLastEntry(String collectionName) async {
+    final lastEntry = await _getEntriesRefByName(collectionName)
         .orderBy('createdAt', descending: true)
         .limit(1)
         .get();
@@ -100,12 +116,11 @@ class FirebaseService {
   }
 
   // Get count for a specific year
-  Future<int> getYearCount(String counterId, int year) async {
+  Future<int> getYearCount(String collectionName, int year) async {
     final startOfYear = DateTime(year, 1, 1);
     final endOfYear = DateTime(year + 1, 1, 1);
 
-    final snapshot = await _entriesRef
-        .where('counterId', isEqualTo: counterId)
+    final snapshot = await _getEntriesRefByName(collectionName)
         .where('createdAt', isGreaterThanOrEqualTo: Timestamp.fromDate(startOfYear))
         .where('createdAt', isLessThan: Timestamp.fromDate(endOfYear))
         .get();
@@ -118,12 +133,11 @@ class FirebaseService {
   }
 
   // Get count for a specific month
-  Future<int> getMonthCount(String counterId, int year, int month) async {
+  Future<int> getMonthCount(String collectionName, int year, int month) async {
     final startOfMonth = DateTime(year, month, 1);
     final endOfMonth = DateTime(year, month + 1, 1);
 
-    final snapshot = await _entriesRef
-        .where('counterId', isEqualTo: counterId)
+    final snapshot = await _getEntriesRefByName(collectionName)
         .where('createdAt', isGreaterThanOrEqualTo: Timestamp.fromDate(startOfMonth))
         .where('createdAt', isLessThan: Timestamp.fromDate(endOfMonth))
         .get();
@@ -136,12 +150,11 @@ class FirebaseService {
   }
 
   // Stream for year count (real-time updates)
-  Stream<int> streamYearCount(String counterId, int year) {
+  Stream<int> streamYearCount(String collectionName, int year) {
     final startOfYear = DateTime(year, 1, 1);
     final endOfYear = DateTime(year + 1, 1, 1);
 
-    return _entriesRef
-        .where('counterId', isEqualTo: counterId)
+    return _getEntriesRefByName(collectionName)
         .where('createdAt', isGreaterThanOrEqualTo: Timestamp.fromDate(startOfYear))
         .where('createdAt', isLessThan: Timestamp.fromDate(endOfYear))
         .snapshots()
@@ -155,12 +168,11 @@ class FirebaseService {
   }
 
   // Stream for month count (real-time updates)
-  Stream<int> streamMonthCount(String counterId, int year, int month) {
+  Stream<int> streamMonthCount(String collectionName, int year, int month) {
     final startOfMonth = DateTime(year, month, 1);
     final endOfMonth = DateTime(year, month + 1, 1);
 
-    return _entriesRef
-        .where('counterId', isEqualTo: counterId)
+    return _getEntriesRefByName(collectionName)
         .where('createdAt', isGreaterThanOrEqualTo: Timestamp.fromDate(startOfMonth))
         .where('createdAt', isLessThan: Timestamp.fromDate(endOfMonth))
         .snapshots()
@@ -174,33 +186,31 @@ class FirebaseService {
   }
 
   // Get all entries for a counter (for stats/heatmap)
-  Stream<List<CounterEntry>> getEntriesForCounter(String counterId) {
-    return _entriesRef
-        .where('counterId', isEqualTo: counterId)
+  Stream<List<CounterEntry>> getEntriesForCounter(String collectionName) {
+    return _getEntriesRefByName(collectionName)
         .orderBy('createdAt', descending: true)
         .snapshots()
         .map((snapshot) =>
-            snapshot.docs.map((doc) => CounterEntry.fromFirestore(doc)).toList());
+            snapshot.docs.map((doc) => CounterEntry.fromFirestoreSimple(doc, collectionName)).toList());
   }
 
   // Get entries for a specific date range (for heatmap)
   Future<List<CounterEntry>> getEntriesForDateRange(
-      String counterId, DateTime start, DateTime end) async {
-    final snapshot = await _entriesRef
-        .where('counterId', isEqualTo: counterId)
+      String collectionName, DateTime start, DateTime end) async {
+    final snapshot = await _getEntriesRefByName(collectionName)
         .where('createdAt', isGreaterThanOrEqualTo: Timestamp.fromDate(start))
         .where('createdAt', isLessThan: Timestamp.fromDate(end))
         .orderBy('createdAt')
         .get();
 
-    return snapshot.docs.map((doc) => CounterEntry.fromFirestore(doc)).toList();
+    return snapshot.docs.map((doc) => CounterEntry.fromFirestoreSimple(doc, collectionName)).toList();
   }
 
   // Get daily counts for a month (for heatmap)
   Future<Map<int, int>> getDailyCountsForMonth(
-      String counterId, int year, int month) async {
+      String collectionName, int year, int month) async {
     final entries = await getEntriesForDateRange(
-      counterId,
+      collectionName,
       DateTime(year, month, 1),
       DateTime(year, month + 1, 1),
     );
@@ -209,6 +219,31 @@ class FirebaseService {
     for (var entry in entries) {
       final day = entry.createdAt.day;
       dailyCounts[day] = (dailyCounts[day] ?? 0) + entry.value;
+    }
+    return dailyCounts;
+  }
+
+  // Get monthly counts for a year (for bar graph)
+  Future<Map<int, int>> getMonthlyCountsForYear(String collectionName, int year) async {
+    Map<int, int> monthlyCounts = {};
+    for (int month = 1; month <= 12; month++) {
+      monthlyCounts[month] = await getMonthCount(collectionName, year, month);
+    }
+    return monthlyCounts;
+  }
+
+  // Get daily counts for entire year (for heatmap)
+  Future<Map<DateTime, int>> getDailyCountsForYear(String collectionName, int year) async {
+    final entries = await getEntriesForDateRange(
+      collectionName,
+      DateTime(year, 1, 1),
+      DateTime(year + 1, 1, 1),
+    );
+
+    Map<DateTime, int> dailyCounts = {};
+    for (var entry in entries) {
+      final date = DateTime(entry.createdAt.year, entry.createdAt.month, entry.createdAt.day);
+      dailyCounts[date] = (dailyCounts[date] ?? 0) + entry.value;
     }
     return dailyCounts;
   }
